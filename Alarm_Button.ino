@@ -10,6 +10,9 @@ this project because of the built-in wireless module.
 Wireless access point connection and status code is included, as well 
 as debounce code for the push button.
 
+Written by Mike Haldas
+mike@viewtron.com
+
 Learn more about this virtual project and Viewtron IP camera NVRs at:
 https://www.Viewtron.com/valarm
 */
