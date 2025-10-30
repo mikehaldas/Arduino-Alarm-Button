@@ -1,37 +1,56 @@
 /* 
-This Arduino sketch creates a wireless alarm button.
+This Arduino sketch creates a wireless alarm button / panic button
+for integration with virtual alarms on Viewtron IP camera NVRs.
+https://www.viewtron.com
+
 When the button is pressed, it triggers a virtual alarm on
-a Viewtron IP camera NVR by sending an HTTP Post to the API webhook
-endpoint on the NVR. 
+a NVR by sending an HTTP Post to the NVR's API / webhook endpoint. 
 
-The ESP8266 NodeMCU CP2102 ESP-12E Development Board was used for
-this project because of the built-in wireless module. 
+The ESP8266 NodeMCU CP2102 ESP-12E Arduino Development Board was used for
+this project because of the small size and built-in wireless module. 
 
-Wireless access point connection and status code is included, as well 
-as debounce code for the push button.
+Wireless connectivity configured via WiFiManager.h by tzapu.
+WiFiManager also being used to configure NVR variables.
 
-Written by Mike Haldas
+Default ad-hoc wireless AP connection for initial setup:
+SSID:  Viewtron-Button
+Password: 12345678
+
+Connect to it and open a web browser to 192.168.1.4 to configure WIFI and NVR variables.
+Hold button for 5 seconds to reset all settings and re-enable ad-hoc wireless AP.
+
+Created by Mike Haldas, co-founder at CCTV Camera Pros
 mike@viewtron.com
-
-Learn more about this virtual project and Viewtron IP camera NVRs at:
-https://www.Viewtron.com/valarm
 */
 
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
+#include <WiFiManager.h>
+#include <EEPROM.h>
 
-// WiFi credentials
-const char* ssid = "";
-const char* wifiPassword = "";
+// ---------- WiFiManager ----------
+WiFiManager wm;
 
-// Viewtron NVR HTTP POST API Configuration
-const char* serverIp = "192.168.0.147"; // Change to IP address or hostname of your Viewtron NVR
-const int serverPort = 80; // NVR HTTP port
-const char* endpoint = "/TriggerVirtualAlarm/17"; //  Virtual alarm API endpoint. Alarm port # on end
-const char* userId = "admin"; // NVR user
-const char* password = "my_password"; // NVR password
+// ---------- Configurable Parameters ----------
+String serverIp = "";
+int    serverPort = 0;
+String userId = "";
+String nvrPassword = "";
+String alarmPort = "";
 
-// XML payload for virtual alarm API call
+// ---------- Pins ----------
+const int buttonPin = 5;
+const int ledPin = 2;
+
+// ---------- Debounce & Reset ----------
+int buttonState = LOW;
+int lastButtonState = LOW;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50;
+unsigned long buttonPressTime = 0;
+const unsigned long resetHoldTime = 5000;
+
+// ---------- XML Payload ----------
 const String xmlPayload = R"(<?xml version="1.0" encoding="utf-8" ?>
 <config version="2.0.0" xmlns="http://www.Sample.ipc.com/ver10">
         <action>
@@ -39,134 +58,227 @@ const String xmlPayload = R"(<?xml version="1.0" encoding="utf-8" ?>
         </action>
 </config>)";
 
-// Setup Pins
-const int buttonPin = 5;  // D1 (GPIO5) for push button
-const int ledPin = 2;     // D4 (GPIO2) for onboard LED (active-low)
+// ---------- EEPROM (Electrically Erasable Programmable Read-Only Memory)----------
+#define EEPROM_SIZE 512
+#define ADDR_SERVER_IP    0
+#define ADDR_SERVER_PORT  64
+#define ADDR_USER_ID      80
+#define ADDR_NVR_PASS     128
+#define ADDR_ALARM_PORT   192
 
-// Variables for button debouncing
-int buttonState = LOW;       // Current debounced state of the button
-int lastButtonState = LOW;   // Previous reading from the input pin
-unsigned long lastDebounceTime = 0;  // Last time the button state changed
-unsigned long debounceDelay = 50;    // Debounce time in ms
+// ---------- WiFiManager Parameters (global) ----------
+WiFiManagerParameter *p_serverIp;
+WiFiManagerParameter *p_serverPort;
+WiFiManagerParameter *p_userId;
+WiFiManagerParameter *p_nvrPass;
+WiFiManagerParameter *p_alarmPort;
 
-void sendHttpPost() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Wi-Fi not connected. Skipping POST.");
-    for (int i = 0; i < 5; i++) {
-      digitalWrite(ledPin, HIGH);  // LED off
-      delay(100);
-      digitalWrite(ledPin, LOW);   // LED on
-      delay(100);
-    }
-    return;
-  }
-
-  Serial.println("Starting HTTP POST...");
-  WiFiClient client;
-  HTTPClient http;
-  String url = "http://" + String(serverIp) + ":" + String(serverPort) + endpoint;
-  http.setTimeout(5000); // Add timeout for robustness
-  if (!http.begin(client, url)) {
-    Serial.println("Failed to begin HTTP connection");
-    for (int i = 0; i < 5; i++) {
-      digitalWrite(ledPin, HIGH);  // LED off
-      delay(100);
-      digitalWrite(ledPin, LOW);   // LED on
-      delay(100);
-    }
-    return;
-  }
-  
-  http.setAuthorization(userId, password);
-  http.addHeader("Content-Type", "application/xml");
-  http.addHeader("Content-Length", String(xmlPayload.length()));
-
-  int httpCode = http.POST(xmlPayload);
-  if (httpCode >= 200 && httpCode < 300) {
-    String response = http.getString();
-    Serial.printf("POST successful! Code: %d\nResponse: %s\n", httpCode, response.c_str());
-    for (int i = 0; i < 2; i++) {
-      digitalWrite(ledPin, HIGH);  // LED off
-      delay(200);
-      digitalWrite(ledPin, LOW);   // LED on
-      delay(200);
-    }
-  } else {
-    Serial.printf("POST failed! Code: %d, Error: %s\n", httpCode, http.errorToString(httpCode).c_str());
-    for (int i = 0; i < 5; i++) {
-      digitalWrite(ledPin, HIGH);  // LED off
-      delay(100);
-      digitalWrite(ledPin, LOW);   // LED on
-      delay(100);
-    }
-  }
-  http.end();
-}
+// ---------- Function Prototypes ----------
+void saveConfig();
+void loadConfig();
+void addCustomParameters();
+void sendHttpPost();
+void blinkLed(int times, int del);
+String readStringEEPROM(int addr);
+void writeStringEEPROM(int addr, const String& s);
+void printConfig();
 
 void setup() {
-  pinMode(buttonPin, INPUT); // Button with external pull-down resistor
+  pinMode(buttonPin, INPUT);
   pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, HIGH);  // LED off initially (active-low)
+  digitalWrite(ledPin, HIGH);
 
   Serial.begin(9600);
-  Serial.println("Setup complete. Connecting to Wi-Fi...");
+  Serial.println("\nBooting...");
 
-  WiFi.begin(ssid, wifiPassword);
+  EEPROM.begin(EEPROM_SIZE);
+  loadConfig();
 
-  while (WiFi.status() != WL_CONNECTED) {
-    digitalWrite(ledPin, LOW);   // LED on
-    delay(500);
-    digitalWrite(ledPin, HIGH);  // LED off
-    delay(500);
-    Serial.print(".");
+  addCustomParameters();
+
+  if (!wm.autoConnect("Viewtron-Button", "12345678")) {
+    Serial.println("Failed to connect. Restarting...");
+    delay(3000);
+    ESP.restart();
   }
 
-  digitalWrite(ledPin, LOW);  // LED stays solid on when Wi-Fi is connected
-  Serial.println("\nWi-Fi connected!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
+  digitalWrite(ledPin, LOW);
+  Serial.println("Wi-Fi connected!");
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
+  printConfig();
 }
 
 void loop() {
-  // Wi-Fi reconnection check
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Wi-Fi disconnected, attempting to reconnect...");
-    WiFi.reconnect();
-    while (WiFi.status() != WL_CONNECTED) {
-      digitalWrite(ledPin, LOW);
-      delay(500);
-      digitalWrite(ledPin, HIGH);
-      delay(500);
-      Serial.print(".");
+    Serial.println("Wi-Fi lost. Reconnecting...");
+    if (!wm.autoConnect("Viewtron-Button", "12345678")) {
+      Serial.println("Reconnect failed. Restarting...");
+      delay(3000);
+      ESP.restart();
     }
     digitalWrite(ledPin, LOW);
-    Serial.println("\nWi-Fi reconnected!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
+    Serial.println("Reconnected!");
   }
 
-  // Read button state
   int reading = digitalRead(buttonPin);
-  // Serial.print("Button reading: "); // Debug output
-  // Serial.println(reading);
 
-  // Check if button state changed
-  if (reading != lastButtonState) {
-    lastDebounceTime = millis(); // Reset debouncing timer
+  if (reading == HIGH && lastButtonState == LOW) {
+    buttonPressTime = millis();
   }
 
-  // If stable for longer than debounce delay
+  if (reading == HIGH && (millis() - buttonPressTime) > resetHoldTime) {
+    Serial.println("RESET ALL SETTINGS!");
+    blinkLed(5, 100);
+    wm.resetSettings();
+    EEPROM.begin(EEPROM_SIZE);
+    for (int i = 0; i < EEPROM_SIZE; i++) EEPROM.write(i, 0);
+    EEPROM.commit();
+    Serial.println("Erased. Restarting...");
+    delay(1000);
+    ESP.restart();
+  }
+
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
   if ((millis() - lastDebounceTime) > debounceDelay) {
-    // Update button state if changed
     if (reading != buttonState) {
       buttonState = reading;
-      // Trigger on HIGH (button pressed)
-      if (buttonState == HIGH) {
-        Serial.println("Button pressed!");
+      if (buttonState == HIGH && (millis() - buttonPressTime) < resetHoldTime) {
+        Serial.println("ALARM TRIGGERED!");
         sendHttpPost();
       }
     }
   }
-  // Update lastButtonState for next iteration
+
   lastButtonState = reading;
+}
+
+// ------------------------------------------------------------
+// Save to EEPROM
+// ------------------------------------------------------------
+void saveConfig() {
+  writeStringEEPROM(ADDR_SERVER_IP,   serverIp);
+  writeStringEEPROM(ADDR_SERVER_PORT, String(serverPort));
+  writeStringEEPROM(ADDR_USER_ID,     userId);
+  writeStringEEPROM(ADDR_NVR_PASS,    nvrPassword);  // <-- FIXED
+  writeStringEEPROM(ADDR_ALARM_PORT,  alarmPort);
+  EEPROM.commit();
+  Serial.println("Config saved.");
+}
+
+// ------------------------------------------------------------
+// Load from EEPROM
+// ------------------------------------------------------------
+void loadConfig() {
+  serverIp     = readStringEEPROM(ADDR_SERVER_IP);
+  serverPort   = readStringEEPROM(ADDR_SERVER_PORT).toInt();
+  userId       = readStringEEPROM(ADDR_USER_ID);
+  nvrPassword  = readStringEEPROM(ADDR_NVR_PASS);
+  alarmPort    = readStringEEPROM(ADDR_ALARM_PORT);
+
+  if (serverIp.length() == 0) serverIp = "192.168.0.100";
+  if (serverPort == 0) serverPort = 80;
+  if (userId.length() == 0) userId = "admin";
+  if (nvrPassword.length() == 0) nvrPassword = "a1111111";
+  if (alarmPort.length() == 0) alarmPort = "9";
+}
+
+// ------------------------------------------------------------
+// Add custom fields for NVR config + save callback
+// ------------------------------------------------------------
+void addCustomParameters() {
+  p_serverIp   = new WiFiManagerParameter("serverIp", "NVR IP", serverIp.c_str(), 16);
+  p_serverPort = new WiFiManagerParameter("port", "NVR Port", String(serverPort).c_str(), 6);
+  p_userId     = new WiFiManagerParameter("user", "NVR User", userId.c_str(), 32);
+  p_nvrPass    = new WiFiManagerParameter("pass", "NVR Password", nvrPassword.c_str(), 32, "password");
+  p_alarmPort  = new WiFiManagerParameter("alarm", "Alarm Port", alarmPort.c_str(), 3);
+
+  wm.addParameter(p_serverIp);
+  wm.addParameter(p_serverPort);
+  wm.addParameter(p_userId);
+  wm.addParameter(p_nvrPass);
+  wm.addParameter(p_alarmPort);
+
+  wm.setSaveConfigCallback([]() {
+    serverIp     = p_serverIp->getValue();
+    serverPort   = String(p_serverPort->getValue()).toInt();
+    userId       = p_userId->getValue();
+    nvrPassword  = p_nvrPass->getValue();
+    alarmPort    = p_alarmPort->getValue();
+    saveConfig();
+  });
+}
+
+// ------------------------------------------------------------
+// HTTP POST
+// ------------------------------------------------------------
+void sendHttpPost() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("No Wi-Fi.");
+    blinkLed(5, 100);
+    return;
+  }
+
+  Serial.println("Sending POST...");
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + serverIp + ":" + String(serverPort) + "/TriggerVirtualAlarm/" + alarmPort;
+
+  http.setTimeout(5000);
+  if (!http.begin(client, url)) {
+    Serial.println("HTTP begin failed");
+    blinkLed(5, 100);
+    return;
+  }
+
+  http.setAuthorization(userId.c_str(), nvrPassword.c_str());
+  http.addHeader("Content-Type", "application/xml");
+
+  int code = http.POST(xmlPayload);
+  if (code >= 200 && code < 300) {
+    Serial.printf("Success: %d\n", code);
+    blinkLed(2, 200);
+  } else {
+    Serial.printf("Failed: %d, %s\n", code, http.errorToString(code).c_str());
+    blinkLed(5, 100);
+  }
+  http.end();
+}
+
+// ------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------
+void blinkLed(int times, int del) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(ledPin, HIGH); delay(del);
+    digitalWrite(ledPin, LOW);  delay(del);
+  }
+}
+
+String readStringEEPROM(int addr) {
+  String s = "";
+  int i = addr;
+  char c;
+  while (i < EEPROM_SIZE && (c = EEPROM.read(i++)) != 0) s += c;
+  return s;
+}
+
+void writeStringEEPROM(int addr, const String& s) {
+  int i;
+  for (i = 0; i < s.length() && addr + i < EEPROM_SIZE; i++) {
+    EEPROM.write(addr + i, s[i]);
+  }
+  EEPROM.write(addr + i, 0);
+}
+
+void printConfig() {
+  Serial.println("=== Config ===");
+  Serial.printf("IP: %s\n", serverIp.c_str());
+  Serial.printf("Port: %d\n", serverPort);
+  Serial.printf("User: %s\n", userId.c_str());
+  Serial.printf("Pass: %s\n", nvrPassword.c_str());
+  Serial.printf("Alarm: %s\n", alarmPort.c_str());
+  Serial.println("==============");
 }
